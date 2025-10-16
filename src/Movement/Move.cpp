@@ -115,7 +115,7 @@ constexpr ObjectModelArrayTableEntry Move::objectModelArrayTable[] =
 	{
 		nullptr,					// no lock needed
 		OBJECT_MODEL_ARRAY_COUNT_NOSELF(2),
-		OBJECT_MODEL_ARRAY_VALUE_NOSELF(reprap.GetGCodes().GetRotationCentre(context.GetLastIndex()))
+		OBJECT_MODEL_ARRAY_VALUE_NOSELF(reprap.GetGCodes().GetRotationCentre(reprap.GetGCodes().GetPrimaryMovementState(), context.GetLastIndex()))
 	},
 #elif SUPPORT_KEEPOUT_ZONES
 	{
@@ -302,7 +302,7 @@ constexpr ObjectModelTableEntry Move::objectModelTable[] =
 
 #if SUPPORT_COORDINATE_ROTATION
 	// 15. move.rotation members
-	{ "angle",					OBJECT_MODEL_FUNC_NOSELF(reprap.GetGCodes().GetRotationAngle()),										ObjectModelEntryFlags::none },
+	{ "angle",					OBJECT_MODEL_FUNC_NOSELF(reprap.GetGCodes().GetRotationAngle(reprap.GetGCodes().GetPrimaryMovementState())),	ObjectModelEntryFlags::none },
 	{ "centre",					OBJECT_MODEL_FUNC_ARRAY(5),																				ObjectModelEntryFlags::none },
 #endif
 };
@@ -383,7 +383,7 @@ void Move::Init() noexcept
 
 		backlashMm[axis] = 0.0;
 		backlashSteps[axis] = 0;
-		backlashStepsDue[axis] = 0;
+		targetBacklashSteps[axis] = currentBacklashSteps[axis] = 0;
 	}
 
 	backlashCorrectionDistanceFactor = DefaultBacklashCorrectionDistanceFactor;
@@ -983,13 +983,33 @@ void Move::Diagnostics(unsigned int part, const StringRef& reply) noexcept
 #endif
 
 #if STEPS_DEBUG
+# if 0	// DEBUG
+			reply.lcat("Pos req/act/dcf/state/seg:");
+# else
 			reply.lcat("Pos req/act/dcf:");
+# endif
 			for (size_t drive = 0; drive < reprap.GetGCodes().GetTotalAxes(); ++drive)
 			{
+# if 0	// DEBUG
+				reply.catf(" %.2f/%" PRIi32 "/%.2f/%u/%u", (double)dms[drive].positionRequested, dms[drive].currentMotorPosition, (double)dms[drive].distanceCarriedForwards, (unsigned int)dms[drive].state, dms[drive].segments != nullptr);
+# else
 				reply.catf(" %.2f/%" PRIi32 "/%.2f", (double)dms[drive].positionRequested, dms[drive].currentMotorPosition, (double)dms[drive].distanceCarriedForwards);
+# endif
 			}
 #endif
-
+#if 0	// DEBUG
+			reply.lcat("ADM:");
+			for (const DriveMovement *dm = activeDMs; dm != nullptr; dm = dm->nextDM)
+			{
+				reply.catf(" %u,%u,%lu", dm->drive, (unsigned int)dm->state, dm->nextStepTime);
+			}
+			reply.cat(" PDM:");
+			for (const DriveMovement *dm = phaseStepDMs; dm != nullptr; dm = dm->nextDM)
+			{
+				reply.catf(" %u,%u,%lu", dm->drive, (unsigned int)dm->state, dm->nextStepTime);
+			}
+			reply.catf(" Now: %lu", StepTimer::GetMovementTimerTicks());
+#endif
 			StepTimer::Diagnostics(reply);
 		}
 		break;
@@ -1109,7 +1129,7 @@ void Move::GetCurrentUserPosition(float m[MaxAxes], MovementSystemNumber msNumbe
 	}
 }
 
-void Move::SetMotorPosition(size_t drive, int32_t pos) noexcept
+void Move::SetMotorPosition(size_t drive, int32_t pos, bool clearBacklash) noexcept
 {
 #if SUPPORT_PHASE_STEPPING
 	uint32_t now = StepTimer::GetTimerTicks();
@@ -1126,8 +1146,18 @@ void Move::SetMotorPosition(size_t drive, int32_t pos) noexcept
 	}
 #endif
 
-	dms[drive].SetMotorPosition(pos);
-
+	if (drive < MaxAxes)
+	{
+		if (clearBacklash)
+		{
+			targetBacklashSteps[drive] = currentBacklashSteps[drive] = 0;
+		}
+		dms[drive].SetMotorPosition(pos + currentBacklashSteps[drive]);
+	}
+	else
+	{
+		dms[drive].SetMotorPosition(pos);				// we don't store backlash info for extruders
+	}
 
 #if SUPPORT_PHASE_STEPPING
 	if (dm->IsPhaseStepEnabled())
@@ -1142,9 +1172,9 @@ void Move::SetMotorPosition(size_t drive, int32_t pos) noexcept
 #endif
 }
 
-void Move::SetMotorPositions(LogicalDrivesBitmap drives, const int32_t *positions) noexcept
+void Move::SetMotorPositions(LogicalDrivesBitmap drives, const int32_t *positions, bool clearBacklash) noexcept
 {
-	drives.Iterate([this, positions](unsigned int drive, unsigned int count) noexcept { SetMotorPosition(drive, positions[drive]); });
+	drives.Iterate([this, positions, clearBacklash](unsigned int drive, unsigned int count) noexcept { SetMotorPosition(drive, positions[drive], clearBacklash); });
 }
 
 void Move::SetLastEndpoints(MovementSystemNumber msNumber, LogicalDrivesBitmap logicalDrives, const int32_t *_ecv_array ep) noexcept
@@ -1165,13 +1195,13 @@ int32_t Move::GetLastEndpoint(MovementSystemNumber msNumber, size_t drive) const
 void Move::ChangeEndpointsAfterHoming(MovementSystemNumber msNumber, LogicalDrivesBitmap drives, const int32_t endpoints[MaxAxes]) noexcept
 {
 	rings[msNumber].SetLastEndpoints(drives, endpoints);
-	SetMotorPositions(drives, endpoints);
+	SetMotorPositions(drives, endpoints, true);
 }
 
 void Move::ChangeSingleEndpointAfterHoming(MovementSystemNumber msNumber, size_t drive, int32_t ep) noexcept
 {
 	rings[msNumber].SetLastEndpoint(drive, ep);
-	SetMotorPosition(drive, ep);
+	SetMotorPosition(drive, ep, true);
 }
 
 // Enter or leave simulation mode
@@ -1340,7 +1370,7 @@ void Move::GetLiveMachineCoordinates(float coords[MaxAxes]) const noexcept
 		AtomicCriticalSectionLocker lock;											// to make sure we get a consistent set of coordinates
 		for (size_t i = 0; i < numTotalAxes; ++i)
 		{
-			currentMotorPositions[i] = dms[i].currentMotorPosition;
+			currentMotorPositions[i] = dms[i].currentMotorPosition - currentBacklashSteps[i];
 		}
 	}
 
@@ -1955,9 +1985,14 @@ void Move::AddLinearSegments(size_t logicalDrive, uint32_t startTime, const Prep
 		{
 			if (dm.ScheduleFirstSegment())
 			{
-				// Always set the direction when starting the first move
-				dm.directionChanged = false;
-				SetDirection(dm.drive, dm.direction);
+#if SUPPORT_PHASE_STEPPING
+				if (dm.state != DMState::phaseStepping)
+#endif
+				{
+					// Always set the direction when starting the first move
+					dm.directionChanged = false;
+					SetDirection(dm.drive, dm.direction);
+				}
 				InsertDM(&dm);
 				if (activeDMs == &dm && simulationMode == SimulationMode::off)			// if this is now the first DM in the active list
 				{
@@ -1968,7 +2003,7 @@ void Move::AddLinearSegments(size_t logicalDrive, uint32_t startTime, const Prep
 				}
 			}
 		}
-	}
+	}		// End of boosted base priority section
 }
 
 // Return true if none of the drives passed has any movement pending
@@ -2152,7 +2187,6 @@ StepMode Move::GetStepMode(size_t axisOrExtruder) const noexcept
 
 void Move::PhaseStepControlLoop() noexcept
 {
-
 	// Record the control loop call interval
 	const StepTimer::Ticks loopCallTime = StepTimer::GetTimerTicks();
 	const StepTimer::Ticks timeElapsed = loopCallTime - prevPSControlLoopCallTime;
@@ -2181,11 +2215,11 @@ void Move::PhaseStepControlLoop() noexcept
 		CheckEndstops(true);												// call out to a separate function because this may help cache locality in the more common and time-critical case where we don't call it
 	}
 
+	bool inserted = false;
 	DriveMovement **dmp = &phaseStepDMs;
 	while (*dmp != nullptr)
 	{
 		DriveMovement * const dm = *dmp;
-
 		GetCurrentMotion(dm->drive, now, dm->phaseStepControl.mParams);
 
 		if (dm->state != DMState::phaseStepping)
@@ -2194,6 +2228,10 @@ void Move::PhaseStepControlLoop() noexcept
 			if (dm->state >= DMState::firstMotionState)
 			{
 				InsertDM(dm);
+				if (activeDMs == dm)
+				{
+					inserted = true;										// we have scheduled a new segment which isn't ready to start, so we need an interrupt
+				}
 			}
 		}
 		else
@@ -2216,6 +2254,14 @@ void Move::PhaseStepControlLoop() noexcept
 		}
 	}
 
+	if (inserted)
+	{
+		BasePriorityBooster booster(NvicPriorityStep);					// shut out the step interrupt
+		if (!ScheduleNextStepInterrupt())
+		{
+			Interrupt();
+		}
+	}
 
 	// Record how long this has taken to run
 	const StepTimer::Ticks loopRuntime = StepTimer::GetTimerTicks() - loopCallTime;
@@ -2298,18 +2344,6 @@ void Move::Interrupt() noexcept
 
 						}
 						//END DEBUG
-#endif
-#if SUPPORT_CAN_EXPANSION
-# if SUPPORT_REMOTE_COMMANDS
-						if (inExpansionMode)
-						{
-							//TODO tell the main board we are behind schedule
-						}
-						else
-# endif
-						{
-							CanMotion::InsertHiccup(hiccupTimeInserted);		// notify expansion boards of the increased delay
-						}
 #endif
 						return;
 					}
@@ -2450,7 +2484,7 @@ void Move::CheckEndstops(bool executingMove) noexcept
 }
 
 // Generate the step pulses of internal drivers used by this DDA
-// Note, we use the movement timer ticks to decide when to generate step pulses, but we must use th raw step timer to enforce delays between pulses.
+// Note, we use the movement timer ticks to decide when to generate step pulses, but we must use the raw step timer to enforce delays between pulses.
 // 'now'is the movement timer ticks
 void Move::StepDrivers(uint32_t now) noexcept
 {
@@ -2570,22 +2604,21 @@ void Move::PrepareForNextSteps(DriveMovement *stopDm, MovementFlags flags, uint3
 			{
 				dm2->driversCurrentlyUsed = dm2->driversNormallyUsed & ~dm2->driverEndstopsTriggeredAtStart;	// we previously set driversCurrentlyUsed to 0 to avoid generating a step, so restore it now
 #if SUPPORT_PHASE_STEPPING || SUPPORT_CLOSED_LOOP
-				if (dm2->state == DMState::phaseStepping)
-				{
-					return;
-				}
+				if (dm2->state != DMState::phaseStepping)				// if we are phase stepping, skip the rest and proceed to the next DM
 #endif
+				{
 # if SUPPORT_CAN_EXPANSION
-				flags |= dm2->segmentFlags;
-				if (unlikely(!flags.checkEndstops && dm2->driversNormallyUsed == 0))
-				{
-					dm2->TakeStepsAndCalcStepTimeRarely(now);
-				}
-				else
+					flags |= dm2->segmentFlags;
+					if (unlikely(!flags.checkEndstops && dm2->driversNormallyUsed == 0))
+					{
+						dm2->TakeStepsAndCalcStepTimeRarely(now);
+					}
+					else
 # endif
-				{
-					(void)dm2->CalcNextStepTimeFull(now); 			// calculate next step time
-					dm2->directionChanged = true;					// force the direction to be set up
+					{
+						(void)dm2->CalcNextStepTimeFull(now); 			// calculate next step time
+						dm2->directionChanged = true;					// force the direction to be set up
+					}
 				}
 			}
 		}
@@ -3180,7 +3213,7 @@ int32_t Move::GetLastMoveStepsTaken(size_t drive) const noexcept
 
 #endif
 
-// Reset all extruder positions to zero. Called when we start a print.
+// Reset all extruder positions to zero. Called when we start a print. All motion must be stopped before we call this, otherwise we will get Code 6 movement system errors.
 void Move::ResetExtruderPositions() noexcept
 {
 	for (size_t drive = MaxAxesPlusExtruders - reprap.GetGCodes().GetNumExtruders(); drive < MaxAxesPlusExtruders; ++drive)
@@ -3203,7 +3236,7 @@ int32_t Move::ApplyBacklashCompensation(size_t drive, int32_t delta) noexcept
 {
 	// If this drive has changed direction, update the backlash correction steps due
 	const bool backwards = (delta < 0);
-	int32_t& stepsDue = backlashStepsDue[drive];
+	int32_t& targetSteps = targetBacklashSteps[drive];
 	if (backwards != lastDirections.IsBitSet(drive))
 	{
 		lastDirections.InvertBit(drive);		// Direction has reversed
@@ -3212,8 +3245,11 @@ int32_t Move::ApplyBacklashCompensation(size_t drive, int32_t delta) noexcept
 		{
 			temp = -temp;
 		}
-		stepsDue += temp;
+		targetSteps += temp;
 	}
+
+	int32_t& currentSteps = currentBacklashSteps[drive];
+	const int32_t stepsDue = targetSteps - currentSteps;
 
 	// Apply some or all of the compensation steps due
 	if (stepsDue != 0)
@@ -3221,13 +3257,13 @@ int32_t Move::ApplyBacklashCompensation(size_t drive, int32_t delta) noexcept
 		if ((unsigned long)labs(stepsDue) * backlashCorrectionDistanceFactor <= (unsigned long)labs(delta))		// avoid a division if we can
 		{
 			delta += stepsDue;
-			stepsDue = 0;
+			currentSteps = targetSteps;
 		}
 		else
 		{
 			const int32_t maxAllowedSteps = (int32_t)max<uint32_t>((uint32_t)labs(delta)/backlashCorrectionDistanceFactor, 1u);
 			const int32_t stepsToDo = (stepsDue < 0) ? max<int32_t>(stepsDue, -maxAllowedSteps) : min<int32_t>(stepsDue, maxAllowedSteps);
-			stepsDue -= stepsToDo;
+			currentSteps += stepsToDo;
 			delta += stepsToDo;
 		}
 	}
